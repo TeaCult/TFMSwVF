@@ -1,4 +1,4 @@
-# Binance Quant Tracker Pro & Algorithmic Trading Framework
+# Trend-Following Momentum Strategy with Volatility Filtering Algorithm Example with Vis-Algo Boilerplate
 
 ## English Version
 
