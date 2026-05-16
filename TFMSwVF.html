@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance Quant Tracker Pro</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #131722; color: #d1d4dc; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        #header { padding: 10px 20px; background: #1e222d; border-bottom: 1px solid #363c4e; display: flex; justify-content: space-between; align-items: center; }
+        #chart-container { flex-grow: 1; width: 100%; }
+        #status-panel { height: 120px; background: #1e222d; border-top: 1px solid #363c4e; padding: 10px; overflow-y: auto; font-size: 13px; }
+        .buy { color: #26a69a; } .sell { color: #ef5350; }
+        .badge { padding: 4px 8px; border-radius: 4px; background: #363c4e; margin-left: 10px; font-family: monospace; }
+    </style>
+</head>
+<body>
+
+<div id="header">
+    <div><b>BTC/USDT</b> <span id="price-badge" class="badge">Yükleniyor...</span></div>
+    <div><span style="color:#2962ff">EMA9</span> | <span style="color:#ff6d00">EMA21</span></div>
+</div>
+<div id="chart-container"></div>
+<div id="status-panel"><strong>Sinyal Geçmişi (EMA + RSI + ATR):</strong><div id="log"></div></div>
+
+<script>
+    const symbol = 'BTCUSDT', interval = '1w';  //1d 1m 1h 1w 1m ....
+    const emaShortP = 9, emaLongP = 21, rsiP = 14, atrP = 14;
+    let historyData = [], markers = [], ws;
+
+    const chart = LightweightCharts.createChart(document.getElementById('chart-container'), {
+        layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#2b2b43' }, horzLines: { color: '#2b2b43' } },
+        timeScale: { timeVisible: true, secondsVisible: false }
+    });
+
+    const candleSeries = chart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350' });
+    const emaShortSeries = chart.addLineSeries({ color: '#2962ff', lineWidth: 2, title: 'EMA9' });
+    const emaLongSeries = chart.addLineSeries({ color: '#ff6d00', lineWidth: 2, title: 'EMA21' });
+
+    function calculateEMA(data, period) {
+        let ema = [];
+        const k = 2 / (period + 1);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+            if (i < period - 1) {
+                sum += data[i].close;
+                ema.push({ time: data[i].time, value: null });
+            } else if (i === period - 1) {
+                sum += data[i].close;
+                ema.push({ time: data[i].time, value: sum / period });
+            } else {
+                ema.push({ time: data[i].time, value: data[i].close * k + ema[i - 1].value * (1 - k) });
+            }
+        }
+        return ema;
+    }
+
+    function calculateRSI(data, period) {
+        let rsi = [];
+        let gains = 0, losses = 0;
+        for (let i = 0; i < data.length; i++) {
+            if (i === 0) { rsi.push({ time: data[i].time, value: null }); continue; }
+            let diff = data[i].close - data[i - 1].close;
+            let gain = diff > 0 ? diff : 0;
+            let loss = diff < 0 ? -diff : 0;
+
+            if (i <= period) {
+                gains += gain; losses += loss;
+                if (i === period) {
+                    let rs = (losses === 0) ? 100 : (gains / period) / (losses / period);
+                    rsi.push({ time: data[i].time, value: 100 - (100 / (1 + rs)) });
+                } else { rsi.push({ time: data[i].time, value: null }); }
+            } else {
+                gains = (gains * (period - 1) + gain) / period;
+                losses = (losses * (period - 1) + loss) / period;
+                let rs = (losses === 0) ? 100 : gains / losses;
+                rsi.push({ time: data[i].time, value: 100 - (100 / (1 + rs)) });
+            }
+        }
+        return rsi;
+    }
+
+    function calculateATR(data, period) {
+        let atr = [];
+        let trs = [];
+        for (let i = 0; i < data.length; i++) {
+            if (i === 0) {
+                trs.push(data[i].high - data[i].low);
+                atr.push({ time: data[i].time, value: null });
+                continue;
+            }
+            let tr = Math.max(data[i].high - data[i].low, Math.abs(data[i].high - data[i - 1].close), Math.abs(data[i].low - data[i - 1].close));
+            trs.push(tr);
+
+            if (i < period) {
+                atr.push({ time: data[i].time, value: null });
+            } else if (i === period) {
+                let sum = trs.reduce((a, b) => a + b, 0);
+                atr.push({ time: data[i].time, value: sum / period });
+            } else {
+                atr.push({ time: data[i].time, value: (atr[i - 1].value * (period - 1) + tr) / period });
+            }
+        }
+        return atr;
+    }
+
+    function addSignal(time, type, price, isHistory = false) {
+        const isBuy = type === 'BUY';
+        markers.push({
+            time: time,
+            position: isBuy ? 'belowBar' : 'aboveBar',
+            color: isBuy ? '#26a69a' : '#ef5350',
+            shape: isBuy ? 'arrowUp' : 'arrowDown',
+            text: isBuy ? 'AL' : 'SAT',
+            size: 2 // Increases both arrow asset footprint and text size natively
+        });
+        if (!isHistory) {
+            const entry = document.createElement('div');
+            entry.className = isBuy ? 'buy' : 'sell';
+            entry.innerHTML = `[${new Date(time * 1000).toLocaleTimeString()}] ${type} @ ${price.toFixed(2)}`;
+            document.getElementById('log').prepend(entry);
+        }
+    }
+
+    async function init() {
+        try {
+            const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=500`);
+            const raw = await res.json();
+            historyData = raw.map(d => ({ time: d[0]/1000, open: +d[1], high: +d[2], low: +d[3], close: +d[4] }));
+
+            const emaS = calculateEMA(historyData, emaShortP);
+            const emaL = calculateEMA(historyData, emaLongP);
+            const rsi = calculateRSI(historyData, rsiP);
+            const atr = calculateATR(historyData, atrP);
+
+            for (let i = 1; i < historyData.length; i++) {
+                if (!emaS[i-1].value || !emaL[i-1].value || !rsi[i].value || !atr[i].value) continue;
+                
+                const filter = 0.1 * atr[i].value;
+                const spread = Math.abs(emaS[i].value - emaL[i].value);
+
+                if (emaS[i-1].value <= emaL[i-1].value && emaS[i].value > emaL[i].value && rsi[i].value > 50 && spread > filter) {
+                    addSignal(historyData[i].time, 'BUY', historyData[i].low, true);
+                }
+                if (emaS[i-1].value >= emaL[i-1].value && emaS[i].value < emaL[i].value && rsi[i].value < 50 && spread > filter) {
+                    addSignal(historyData[i].time, 'SELL', historyData[i].high, true);
+                }
+            }
+
+            candleSeries.setData(historyData);
+            emaShortSeries.setData(emaS.filter(d => d.value));
+            emaLongSeries.setData(emaL.filter(d => d.value));
+            candleSeries.setMarkers(markers);
+            startWebSocket();
+        } catch (e) { console.error("Yükleme hatası:", e); }
+    }
+
+    function startWebSocket() {
+        ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${interval}`);
+        ws.onmessage = (e) => {
+            const { k } = JSON.parse(e.data);
+            const candle = { time: k.t/1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c };
+            
+            candleSeries.update(candle);
+            document.getElementById('price-badge').innerText = `${candle.close.toFixed(2)} USDT`;
+
+            const lastIdx = historyData.length - 1;
+            if (historyData[lastIdx].time === candle.time) historyData[lastIdx] = candle;
+            else historyData.push(candle);
+
+            const emaS_arr = calculateEMA(historyData, emaShortP);
+            const emaL_arr = calculateEMA(historyData, emaLongP);
+            
+            if (emaS_arr[lastIdx].value) emaShortSeries.update(emaS_arr[lastIdx]);
+            if (emaL_arr[lastIdx].value) emaLongSeries.update(emaL_arr[lastIdx]);
+
+            if (k.x) { 
+                const len = historyData.length;
+                const rsi_arr = calculateRSI(historyData, rsiP);
+                const atr_arr = calculateATR(historyData, atrP);
+
+                const prevS = emaS_arr[len - 2].value;
+                const prevL = emaL_arr[len - 2].value;
+                const currS = emaS_arr[len - 1].value;
+                const currL = emaL_arr[len - 1].value;
+                const currRsi = rsi_arr[len - 1].value;
+                const currAtr = atr_arr[len - 1].value;
+
+                if (prevS && prevL && currRsi && currAtr) {
+                    const filter = 0.1 * currAtr;
+                    const spread = Math.abs(currS - currL);
+
+                    if (prevS <= prevL && currS > currL && currRsi > 50 && spread > filter) addSignal(candle.time, 'BUY', candle.low);
+                    if (prevS >= prevL && currS < currL && currRsi < 50 && spread > filter) addSignal(candle.time, 'SELL', candle.high);
+                    candleSeries.setMarkers(markers);
+                }
+            }
+        };
+        ws.onclose = () => setTimeout(startWebSocket, 5000);
+    }
+
+    window.addEventListener('resize', () => chart.resize(window.innerWidth, document.getElementById('chart-container').offsetHeight));
+    init();
+</script>
+</body>
+</html>
